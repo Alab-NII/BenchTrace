@@ -3,6 +3,8 @@
 This repository contains the code for **BenchTrace**, a benchmark for evaluating self-evolution ability in LLM agents.
 BenchTrace consists of a snapshot-reflection dataset of 1,821 annotated episodes spanning six tasks, paired with two evaluation suites: Reflection Evaluation and Evolution Evaluation.
 
+📊 **Dataset:** [huangjh16/BenchTrace on Hugging Face](https://huggingface.co/datasets/huangjh16/BenchTrace)
+
 ![BenchTrace Overview](figures/overview.png)
 
 ## Repository Structure
