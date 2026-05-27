@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+GroupTravelPlanning Evolution Evaluation runner — ReAct baseline
+
+ReAct (Yao et al., 2022): brief reasoning followed by plan generation.
+No evolution snapshots used: agent relies solely on in-context reasoning.
+
+GroupTravelPlanning differences from step-based environments:
+  - One env.step() = one traveler's complete itinerary plan (free-text generation)
+  - env.step() calls an LLM judge to score constraint satisfaction
+  - Prior travelers' plans shown as context (RELATION/JOIN constraints reference
+    specific restaurant/accommodation choices made by earlier travelers)
+  - decision_point//2 = failing traveler index; restore via direct state setting
+  - scoring_method="one_step": only the failing traveler's plan is evaluated
+"""
+
+import re
+import json
+import time
+import argparse
+import traceback
+from pathlib import Path
+
+from utils import (
+    DATASET_ROOT,
+    RESULTS_ROOT,
+    MAX_CONTEXT_TOKENS,
+    STEP_LIMIT,
+    GAME_LIST,
+    load_snapshots,
+    load_dataset_split,
+    make_env,
+    restore_game_state,
+    format_prior_plans,
+)
+from src.openai_helpers import chat_completion_with_retries, truncate_text
+
+# ---------------------------------------------------------------------------
+# ReAct prompts for group travel planning
+# ---------------------------------------------------------------------------
+
+REACT_SYSTEM_PROMPT = (
+    "You are an expert group travel planner. For each traveler, you will be given "
+    "the base itinerary and the traveler's personalized constraints. Generate a complete "
+    "day-by-day travel plan that explicitly satisfies every constraint: cuisine types, "
+    "price ranges, ratings, and JOIN/RELATION constraints referencing specific choices "
+    "made by prior travelers."
+)
+
+REACT_FORMAT = (
+    "\nGenerate a complete day-by-day travel plan for the current traveler. "
+    "Think briefly, then provide the full plan explicitly addressing every constraint.\n"
+)
+
+
+def parse_travel_response(response: str) -> str:
+    """Strip thinking tags and return the travel plan."""
+    if not response:
+        return "No plan available."
+    text = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
+    return text if text else response.strip()
+
+
+# ---------------------------------------------------------------------------
+# ReAct agent
+# ---------------------------------------------------------------------------
+
+class ReActBaseline:
+    def __init__(self, model: str, temperature: float = 0.4):
+        self.model = model
+        self.temperature = temperature
+
+    def make_agent_fn(self, pre_dp_context: str):
+        current_run_plans: list[tuple[str, str]] = []  # (question, plan)
+
+        def agent_fn(obs: str, subtask_idx: int):
+            user_prompt = ""
+            if pre_dp_context:
+                user_prompt += "=== Prior Travelers' Plans (this episode) ===\n"
+                user_prompt += pre_dp_context + "\n\n"
+            if current_run_plans:
+                user_prompt += "=== Plans Generated in This Run ===\n"
+                for i, (q, p) in enumerate(current_run_plans):
+                    n = subtask_idx - len(current_run_plans) + i + 1
+                    user_prompt += f"Traveler {n + 1}: {q[:200]}\nPlan: {p[:400]}\n\n"
+            user_prompt += "=== Current Traveler ===\n"
+            user_prompt += obs
+            user_prompt += REACT_FORMAT
+
+            res = chat_completion_with_retries(
+                model=self.model,
+                sys_prompt=REACT_SYSTEM_PROMPT,
+                prompt=truncate_text(user_prompt, MAX_CONTEXT_TOKENS),
+                max_tokens=1024,
+                temperature=self.temperature,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            raw = res.choices[0].message.content if res and res.choices else ""
+            action = parse_travel_response(raw)
+
+            current_run_plans.append((obs[:200], action))
+            return action, raw
+
+        return agent_fn
+
+
+# ---------------------------------------------------------------------------
+# Task runner
+# ---------------------------------------------------------------------------
+
+def run_task(task: dict, snapshots: dict, baseline: ReActBaseline,
+             judge_model: str, dataset, output_dir: Path) -> dict:
+    task_id = task["id"]
+    game = task["game"]
+    decision_point = task["test_snapshot"]["decision_point"]
+    test_ep_id = task["test_snapshot"]["episode_id"]
+
+    test_ep = snapshots[test_ep_id]
+    test_trajectory = test_ep["snapshot"]["trajectory"]
+    pre_dp_context = format_prior_plans(test_trajectory, decision_point)
+
+    env = make_env(test_ep_id, judge_model, dataset)
+    ob, info = restore_game_state(env, test_trajectory, decision_point)
+
+    log_path = output_dir / f"{task_id}.log"
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(f"Task: {task_id}\nBaseline: react\n")
+        f.write(f"Game: {game}, Decision point: {decision_point}\n")
+        f.write(f"Test episode: {test_ep_id}\n\n")
+        if pre_dp_context:
+            f.write(f"=== Prior context ===\n{pre_dp_context[:500]}\n\n")
+        f.write(f"=== Starting traveler {decision_point // 2} ===\n{ob[:300]}\n\n")
+
+    agent_fn = baseline.make_agent_fn(pre_dp_context)
+    trajectory = []
+    cur_ob, cur_info = ob, info
+    start_subtask = decision_point // 2
+
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            for subtask_step in range(start_subtask, start_subtask + STEP_LIMIT):
+                action, raw = agent_fn(cur_ob, subtask_step)
+
+                f.write(f"[Traveler {subtask_step}] OBS: {cur_ob[:100]}\n")
+                f.write(f"               RAW: {raw[:150]}\n")
+                f.write(f"               ACTION: {action[:200]}\n")
+
+                trajectory.append({
+                    "subtask_idx": subtask_step,
+                    "obs": cur_ob,
+                    "action": action,
+                    "raw_response": raw,
+                })
+
+                cur_ob, done, cur_info = env.step(action)
+                trajectory[-1]["progress_after"] = cur_info.get("progress", 0.0)
+                trajectory[-1]["won"] = cur_info.get("won", False)
+
+                print(
+                    f"  [traveler {subtask_step}] progress={cur_info.get('progress', 0):.3f}, "
+                    f"won={cur_info.get('won', False)}"
+                )
+
+                if done:
+                    break
+    finally:
+        env.close()
+
+    first_step = trajectory[0] if trajectory else {}
+    last_step = trajectory[-1] if trajectory else {}
+    return {
+        "task_id": task_id,
+        "baseline": "react",
+        "game": game,
+        "type": task["type"],
+        "distance": task["distance"],
+        "target_failure_instance": task["target_failure_instance"],
+        "test_episode_id": test_ep_id,
+        "decision_point": decision_point,
+        "scoring_method": task["scoring_method"],
+        "action_at_decision_point": first_step.get("action"),
+        "obs_at_decision_point": first_step.get("obs"),
+        "final_progress": last_step.get("progress_after"),
+        "won": last_step.get("won", False),
+        "trajectory_from_decision_point": trajectory,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--game", required=True, choices=GAME_LIST)
+    parser.add_argument("--model", default="openai/gpt-4.1")
+    parser.add_argument("--judge_model", default=None,
+                        help="LLM judge model (default: same as --model)")
+    parser.add_argument("--temperature", default=0.4, type=float)
+    parser.add_argument("--task_ids", nargs="*")
+    parser.add_argument("--distances", nargs="*", type=int, default=None)
+    parser.add_argument("--output_dir", default=None)
+    args = parser.parse_args()
+    judge_model = args.judge_model or args.model
+
+    ee_path = DATASET_ROOT / args.game / "evolution_evaluation.json"
+    with open(ee_path) as f:
+        ee_data = json.load(f)
+    snapshots = load_snapshots()
+    dataset = load_dataset_split()
+
+    tasks = ee_data["tasks"]
+    if args.task_ids:
+        tasks = [t for t in tasks if t["id"] in args.task_ids]
+    if args.distances:
+        tasks = [t for t in tasks if t["distance"] in args.distances]
+
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        model_slug = args.model.replace("/", "_")
+        output_dir = RESULTS_ROOT / args.game / "react" / model_slug / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Running ReAct on {args.game} ({len(tasks)} tasks)")
+    print(f"Model: {args.model} | Judge: {judge_model} | Output: {output_dir}")
+
+    baseline = ReActBaseline(model=args.model, temperature=args.temperature)
+
+    results = []
+    for i, task in enumerate(tasks):
+        print(f"\n[{i+1}/{len(tasks)}] {task['id']} "
+              f"(type={task['type']}, dist={task['distance']})")
+        try:
+            result = run_task(task, snapshots, baseline, judge_model, dataset, output_dir)
+            results.append(result)
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            traceback.print_exc()
+            results.append({"task_id": task["id"], "error": str(e)})
+
+    results_path = output_dir / "results.json"
+    with open(results_path, "w") as f:
+        json.dump({
+            "game": args.game,
+            "baseline": "react",
+            "model": args.model,
+            "judge_model": judge_model,
+            "n_tasks": len(tasks),
+            "results": results,
+        }, f, indent=2, ensure_ascii=False)
+
+    print(f"\nDone. Results saved to {results_path}")
+
+
+if __name__ == "__main__":
+    main()
