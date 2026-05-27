@@ -18,6 +18,8 @@ benchrogue_code/
 └── analysis/               # Analysis and plotting scripts
 ```
 
+> **Note on Jericho game files:** Zork and other Infocom game data (ROMs and `.qzl` saved-game files) are proprietary and are **not** included in this repository for copyright reasons. To run the Jericho evaluation, obtain the game files separately (see the [Jericho project](https://github.com/microsoft/jericho)) and place them under `evaluation/evolution/jericho/`.
+
 Each of the three top-level modules contains a subdirectory per task:
 - `jericho` — Jericho text adventure games
 - `alfworld` — ALFWorld embodied household tasks
